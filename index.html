@@ -18,14 +18,25 @@
   <div id="status"></div>
   <script>
     /*
-     * 찍고 지도 페이지 (GitHub Pages 호스팅용)
-     * - 앱(React Native WebView)이 이 페이지를 열고, JIKGO_render(json)로 마커를 주입합니다.
-     * - 마커 탭 등 이벤트는 postMessage로 앱에 전달합니다.
-     * - NCP Client ID는 URL 쿼리(?ncpKeyId=...)로 전달받습니다.
+     * 찍고 지도 페이지 v2 (GitHub Pages 호스팅용)
+     * 외부 API:
+     *   JIKGO_setMarkers(json)  — 마커 배열 교체 + 자동 fitBounds
+     *   JIKGO_setSelected(id)   — 선택 상태만 변경 (지도 이동 없음)
+     *   JIKGO_setCenter(lat,lng,zoom?)  — 지도 중심을 명시적으로 이동
+     * 이벤트 (postMessage로 RN에 전달):
+     *   { type: 'ready' }
+     *   { type: 'select', id }
+     *   { type: 'idle',  lat, lng, zoom }   — 지도 이동/줌 완료 시
+     *   { type: 'error', message }
      */
     var map = null;
-    var markers = [];
-    var pendingData = null; // 지도 준비 전에 들어온 데이터 보관
+    var allMarkers = []; // [{ marker, data }]
+    var currentSelectedId = null;
+
+    // 지도 준비 전에 들어온 호출을 보관
+    var pendingMarkers = null;
+    var pendingSelected = null;
+    var pendingCenter = null;
 
     function post(obj) {
       if (window.ReactNativeWebView) {
@@ -45,91 +56,121 @@
         .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
 
-    // 네이버 인증 실패 시 호출되는 전역 콜백
     window.navermap_authFailure = function () {
       showStatus('네이버 지도 인증 실패 — NCP에 이 페이지 도메인이 등록되었는지 확인하세요.');
       post({ type: 'error', message: 'auth_failure' });
     };
 
-    // 앱에서 마커 데이터를 주입할 때 호출하는 함수
-    window.JIKGO_render = function (json) {
-      var payload;
-      try {
-        payload = JSON.parse(json);
-      } catch (e) {
-        return;
-      }
-      if (!map) {
-        pendingData = payload; // 지도 아직 준비 안 됨 → 보관
-        return;
-      }
-      drawMarkers(payload);
-    };
+    function buildIcon(d, isSelected) {
+      return {
+        content:
+          '<div style="' +
+            'transform: translate(-50%, -100%);' +
+            'background:' + (isSelected ? '#6C63FF' : '#1A1A2E') + ';' +
+            'color:#fff; padding:6px 10px; border-radius:18px;' +
+            'font-family:-apple-system,sans-serif; font-size:13px; font-weight:600;' +
+            'white-space:nowrap; box-shadow:0 2px 8px rgba(0,0,0,0.25);' +
+            'border:2px solid #fff;' +
+          '">' + (d.emoji ? escapeHtml(d.emoji) + ' ' : '') + escapeHtml(d.name) + '</div>',
+        anchor: new naver.maps.Point(0, 0),
+      };
+    }
 
-    function drawMarkers(payload) {
-      var data = payload.markers || [];
-      var selectedId = payload.selectedId || null;
+    function applyMarkers(data) {
+      // 기존 마커 제거
+      allMarkers.forEach(function (m) { m.marker.setMap(null); });
+      allMarkers = [];
 
-      markers.forEach(function (m) { m.setMap(null); });
-      markers = [];
-
-      if (data.length === 0) return;
+      if (!data || data.length === 0) return;
 
       var bounds = new naver.maps.LatLngBounds();
       data.forEach(function (d) {
         var pos = new naver.maps.LatLng(d.lat, d.lng);
         bounds.extend(pos);
-        var isSelected = d.id === selectedId;
         var marker = new naver.maps.Marker({
           position: pos,
           map: map,
           title: d.name,
-          zIndex: isSelected ? 1000 : 1,
-          icon: {
-            content:
-              '<div style="' +
-                'transform: translate(-50%, -100%);' +
-                'background:' + (isSelected ? '#6C63FF' : '#1A1A2E') + ';' +
-                'color:#fff; padding:6px 10px; border-radius:18px;' +
-                'font-family:-apple-system,sans-serif; font-size:13px; font-weight:600;' +
-                'white-space:nowrap; box-shadow:0 2px 8px rgba(0,0,0,0.25);' +
-                'border:2px solid #fff;' +
-              '">' + (d.emoji ? escapeHtml(d.emoji) + ' ' : '') + escapeHtml(d.name) + '</div>',
-            anchor: new naver.maps.Point(0, 0),
-          },
+          zIndex: d.id === currentSelectedId ? 1000 : 1,
+          icon: buildIcon(d, d.id === currentSelectedId),
         });
         (function (id) {
           naver.maps.Event.addListener(marker, 'click', function () {
             post({ type: 'select', id: id });
           });
         })(d.id);
-        markers.push(marker);
+        allMarkers.push({ marker: marker, data: d });
       });
 
       if (data.length > 1) {
-        map.fitBounds(bounds, { top: 70, right: 60, bottom: 120, left: 60 });
+        map.fitBounds(bounds, { top: 80, right: 60, bottom: 160, left: 60 });
       } else {
         map.setCenter(bounds.getCenter());
-        map.setZoom(15);
+        if (map.getZoom() < 14) map.setZoom(15);
       }
     }
+
+    function applySelection(id) {
+      currentSelectedId = id;
+      allMarkers.forEach(function (m) {
+        var isSelected = m.data.id === id;
+        m.marker.setIcon(buildIcon(m.data, isSelected));
+        m.marker.setZIndex(isSelected ? 1000 : 1);
+      });
+    }
+
+    window.JIKGO_setMarkers = function (json) {
+      var data;
+      try { data = JSON.parse(json); }
+      catch (e) { return; }
+      if (!map) { pendingMarkers = data; return; }
+      applyMarkers(data);
+    };
+
+    window.JIKGO_setSelected = function (id) {
+      if (!map) { pendingSelected = id; return; }
+      applySelection(id);
+    };
+
+    window.JIKGO_setCenter = function (lat, lng, zoom) {
+      if (!map) { pendingCenter = { lat: lat, lng: lng, zoom: zoom }; return; }
+      map.setCenter(new naver.maps.LatLng(lat, lng));
+      if (zoom != null) map.setZoom(zoom);
+    };
 
     function initMap() {
       map = new naver.maps.Map('map', {
         center: new naver.maps.LatLng(37.5665, 126.9780),
-        zoom: 12,
+        zoom: 13,
         mapDataControl: false,
         scaleControl: false,
         logoControl: true,
       });
+
+      // 지도 이동/줌 완료 시 알림
+      naver.maps.Event.addListener(map, 'idle', function () {
+        var c = map.getCenter();
+        post({ type: 'idle', lat: c.lat(), lng: c.lng(), zoom: map.getZoom() });
+      });
+
       post({ type: 'ready' });
-      if (pendingData) {
-        drawMarkers(pendingData);
-        pendingData = null;
+
+      // 보관해둔 호출 처리 (순서 중요: center → markers → selected)
+      if (pendingCenter) {
+        map.setCenter(new naver.maps.LatLng(pendingCenter.lat, pendingCenter.lng));
+        if (pendingCenter.zoom != null) map.setZoom(pendingCenter.zoom);
+        pendingCenter = null;
+      }
+      if (pendingMarkers) {
+        applyMarkers(pendingMarkers);
+        pendingMarkers = null;
+      }
+      if (pendingSelected) {
+        applySelection(pendingSelected);
+        pendingSelected = null;
       }
     }
 
-    // 시작: URL 쿼리에서 NCP 키를 읽어 네이버 지도 스크립트 로드
     (function () {
       var params = new URLSearchParams(location.search);
       var ncpKey = params.get('ncpKeyId') || '';
