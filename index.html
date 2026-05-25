@@ -76,7 +76,7 @@
       };
     }
 
-    function applyMarkers(data) {
+    function applyMarkers(data, fit) {
       // 기존 마커 제거
       allMarkers.forEach(function (m) { m.marker.setMap(null); });
       allMarkers = [];
@@ -102,6 +102,7 @@
         allMarkers.push({ marker: marker, data: d });
       });
 
+      if (!fit) return;
       if (data.length > 1) {
         map.fitBounds(bounds, { top: 80, right: 60, bottom: 160, left: 60 });
       } else {
@@ -123,8 +124,17 @@
       var data;
       try { data = JSON.parse(json); }
       catch (e) { return; }
-      if (!map) { pendingMarkers = data; return; }
-      applyMarkers(data);
+      if (!map) { pendingMarkers = { data: data, fit: true }; return; }
+      applyMarkers(data, true);
+    };
+
+    // 현재 지도 시점을 유지한 채 마커만 교체 (이 지역 재검색용)
+    window.JIKGO_setMarkersKeepView = function (json) {
+      var data;
+      try { data = JSON.parse(json); }
+      catch (e) { return; }
+      if (!map) { pendingMarkers = { data: data, fit: false }; return; }
+      applyMarkers(data, false);
     };
 
     window.JIKGO_setSelected = function (id) {
@@ -162,7 +172,7 @@
         pendingCenter = null;
       }
       if (pendingMarkers) {
-        applyMarkers(pendingMarkers);
+        applyMarkers(pendingMarkers.data, pendingMarkers.fit);
         pendingMarkers = null;
       }
       if (pendingSelected) {
